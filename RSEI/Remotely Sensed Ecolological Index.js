@@ -1,9 +1,7 @@
 /*******************************************************
- RSEI (PCA) — FIXED GEE script for Gazipur (FAO GAUL)
- - Landsat C2 L2 for spectral indices
- - MODIS MOD11A2 for LST (resampled to Landsat)
+ RSEI (PCA) — GEE script for Gazipur (FAO GAUL)
+ - Landsat C2 L2 for spectral indices AND LST
  - Standardization + PCA -> RSEI normalized 0..1
- FIXES: correlation keys, array indexing, memory optimization
 *******************************************************/
 
 // ----------------------------
@@ -19,32 +17,17 @@ var districtName = 'Gazipur';
 // ----------------------------
 // 1) Load FAO GAUL and select Gazipur AOI
 // ----------------------------
-var gaulFC = ee.FeatureCollection('FAO/GAUL/2015/' + gaulLevel);
 
-function findGazipur(fc, name) {
-  var f = fc.filter(ee.Filter.or(
-    ee.Filter.eq('ADM2_NAME', name),
-    ee.Filter.eq('ADM2_EN', name),
-    ee.Filter.stringContains('ADM2_NAME', name),
-    ee.Filter.stringContains('ADM2_EN', name),
-    ee.Filter.eq('ADM1_NAME', name),
-    ee.Filter.eq('ADM1_EN', name),
-    ee.Filter.stringContains('ADM1_NAME', name),
-    ee.Filter.stringContains('ADM1_EN', name)
-  )).first();
+var gaul = ee.FeatureCollection('FAO/GAUL/2015/level2');
 
-  f = ee.Algorithms.If(f, f, fc.filter(ee.Filter.stringContains('ADM2_NAME', name)).first());
-  return ee.Feature(f);
-}
-
-var gazipur = findGazipur(gaulFC, districtName);
-gazipur = ee.Feature(ee.Algorithms.If(gazipur, gazipur,
-  gaulFC.filter(ee.Filter.stringContains('ADM1_NAME', 'Dhaka')).first()
+// Filter to Bangladesh -> Gazipur (ADM0_NAME, ADM2_NAME are GAUL attributes)
+var gazipur = gaul.filter(ee.Filter.and(
+  ee.Filter.eq('ADM0_NAME', 'Bangladesh'),
+  ee.Filter.eq('ADM2_NAME', 'Gazipur')
 ));
 
-var gazipur_fc = ee.FeatureCollection([gazipur]);
-Map.centerObject(gazipur_fc, 10);
-Map.addLayer(gazipur_fc.style({color: 'FF0000', width: 2}), {}, 'Gazipur (GAUL)');
+Map.centerObject(gazipur, 10);
+Map.addLayer(gazipur.style({color: 'FF0000', width: 2}), {}, 'Gazipur (GAUL)');
 
 // ----------------------------
 // 2) Landsat Collection-2 Level-2 (SR) processing
@@ -107,27 +90,37 @@ Map.addLayer(ndvi, {min: -0.2, max: 0.8}, 'NDVI');
 Map.addLayer(ndbsi, {min: -1, max: 1}, 'NDBSI');
 
 // ----------------------------
-// 4) LST from MODIS (with reduced scale for memory)
+// 4) LST from Landsat ST_B10 (REPLACED MODIS)
 // ----------------------------
-var modisLSTcol = ee.ImageCollection('MODIS/061/MOD11A2')
-  .filterDate(startDate, endDate)
-  .filterBounds(gazipur.geometry())
-  .select('LST_Day_1km');
 
-print('MODIS MOD11A2 images count:', modisLSTcol.size());
+// Function to convert Landsat ST_B10 to Celsius
+function convertLandsatLST(image) {
+  var lst = image.select('ST_B10')
+    .multiply(0.00341802)  // Scale factor for ST_B10
+    .add(149.0)            // Offset for ST_B10
+    .subtract(273.15)      // Convert Kelvin to Celsius
+    .rename('LST_Landsat');
+  
+  // Apply the same cloud mask as the surface reflectance bands
+  var qa = image.select('QA_PIXEL');
+  var cloudBit = 1 << 3;
+  var cloudShadowBit = 1 << 4;
+  var mask = qa.bitwiseAnd(cloudBit).eq(0)
+               .and(qa.bitwiseAnd(cloudShadowBit).eq(0));
+  
+  return lst.updateMask(mask);
+}
 
-var lstModisMedian = modisLSTcol.median()
-  .multiply(0.02).subtract(273.15).rename('LST_MODIS');
+// Apply LST conversion to the collection and get median
+var lstLandsat = l8sr.map(convertLandsatLST).median().clip(gazipur.geometry());
 
-var landsatProj = medianL8.select('SR_B4').projection();
-var lst_resampled = lstModisMedian.reproject({crs: landsatProj.crs(), scale: analysisScale}).clip(gazipur.geometry());
-
-Map.addLayer(lst_resampled, {min: 20, max: 40}, 'LST (MODIS resampled °C)');
+print('Using Landsat LST from ST_B10 band');
+Map.addLayer(lstLandsat, {min: 20, max: 40}, 'LST (Landsat ST_B10 °C)');
 
 // ----------------------------
 // 5) Compose and standardize indicators
 // ----------------------------
-var indicators = ee.Image.cat([ndvi, wet, ndbsi, lst_resampled])
+var indicators = ee.Image.cat([ndvi, wet, ndbsi, lstLandsat])
   .rename(['NDVI', 'WET', 'NDBSI', 'LST']).toFloat();
 var bandNames = indicators.bandNames();
 print('Indicator band order:', bandNames);
@@ -196,8 +189,8 @@ var pcImage = PCs.arrayProject([0]).arrayFlatten([pcNames]);
 // ----------------------------
 // 7) FIXED correlation calculation and RSEI normalization
 // ----------------------------
-// Create a combined image for correlation
-var correlationImage = pcImage.select('PC1').addBands(ndvi);
+// Create a combined image for all correlations
+var correlationImage = pcImage.select('PC1').addBands([ndvi, wet, ndbsi, lstLandsat]);
 
 // Sample for correlation calculation
 var correlationSample = correlationImage.sample({
@@ -208,18 +201,42 @@ var correlationSample = correlationImage.sample({
   geometries: false
 });
 
-var corrDict = correlationSample.reduceColumns({
+// Calculate PC1 correlations with all indicators
+var corrDict_NDVI = correlationSample.reduceColumns({
   reducer: ee.Reducer.pearsonsCorrelation(),
   selectors: ['PC1', 'NDVI']
 });
 
-print('Correlation dictionary:', corrDict);
-var corrVal = ee.Number(corrDict.get('correlation'));
-print('PC1-NDVI correlation:', corrVal);
+var corrDict_WET = correlationSample.reduceColumns({
+  reducer: ee.Reducer.pearsonsCorrelation(),
+  selectors: ['PC1', 'WET']
+});
 
-// Determine RSEI orientation
+var corrDict_NDBSI = correlationSample.reduceColumns({
+  reducer: ee.Reducer.pearsonsCorrelation(),
+  selectors: ['PC1', 'NDBSI']
+});
+
+var corrDict_LST = correlationSample.reduceColumns({
+  reducer: ee.Reducer.pearsonsCorrelation(),
+  selectors: ['PC1', 'LST_Landsat']
+});
+
+// Extract correlation values
+var corrVal_NDVI = ee.Number(corrDict_NDVI.get('correlation'));
+var corrVal_WET = ee.Number(corrDict_WET.get('correlation'));
+var corrVal_NDBSI = ee.Number(corrDict_NDBSI.get('correlation'));
+var corrVal_LST = ee.Number(corrDict_LST.get('correlation'));
+
+print('PC1 Correlations with Indicators:');
+print('PC1-NDVI correlation:', corrVal_NDVI);
+print('PC1-WET correlation:', corrVal_WET);
+print('PC1-NDBSI correlation:', corrVal_NDBSI);
+print('PC1-LST correlation:', corrVal_LST);
+
+// Determine RSEI orientation (using NDVI correlation as primary indicator)
 var rseiRaw = ee.Algorithms.If(
-  corrVal.gt(0),
+  corrVal_NDVI.gt(0),
   pcImage.select('PC1'),
   pcImage.select('PC1').multiply(-1)
 );
@@ -279,11 +296,87 @@ print('PC1 loadings (order = NDVI, WET, NDBSI, LST):', pc1Loadings);
 // Summary diagnostics
 var diagnostics = ee.Dictionary({
   'Landsat_count': l8srMasked.size(),
-  'MODIS_count': modisLSTcol.size(),
+  'LST_source': 'Landsat_ST_B10',
   'Mean_RSEI': rseiMean.get('mean'),
   'PC1_explained_pct': pc1ExplainedPct,
-  'PC1_NDVI_correlation': corrVal
+  'PC1_NDVI_correlation': corrVal_NDVI,
+  'PC1_WET_correlation': corrVal_WET,
+  'PC1_NDBSI_correlation': corrVal_NDBSI,
+  'PC1_LST_correlation': corrVal_LST
 });
 print('Key diagnostics summary:', diagnostics);
 
-// END OF FIXED SCRIPT
+// ----------------------------
+// 9) Scree Plot - Explained Variance Chart
+// ----------------------------
+
+// Calculate explained variance for all components
+var totalVariance = eigenValues.reduce(ee.Reducer.sum(), [0]).get([0, 0]);
+
+// Extract individual eigenvalues and calculate percentages
+var pc1_var = ee.Number(eigenValues.get([0, 0])).divide(ee.Number(totalVariance)).multiply(100);
+var pc2_var = ee.Number(eigenValues.get([1, 0])).divide(ee.Number(totalVariance)).multiply(100);
+var pc3_var = ee.Number(eigenValues.get([2, 0])).divide(ee.Number(totalVariance)).multiply(100);
+var pc4_var = ee.Number(eigenValues.get([3, 0])).divide(ee.Number(totalVariance)).multiply(100);
+
+print('PC1 explained variance (%):', pc1_var);
+print('PC2 explained variance (%):', pc2_var);
+print('PC3 explained variance (%):', pc3_var);
+print('PC4 explained variance (%):', pc4_var);
+
+// Create data for scree plot
+var screeData = ee.FeatureCollection([
+  ee.Feature(null, {'PC': 1, 'Explained_Variance_Pct': pc1_var}),
+  ee.Feature(null, {'PC': 2, 'Explained_Variance_Pct': pc2_var}),
+  ee.Feature(null, {'PC': 3, 'Explained_Variance_Pct': pc3_var}),
+  ee.Feature(null, {'PC': 4, 'Explained_Variance_Pct': pc4_var})
+]);
+
+// Create scree plot
+var screeChart = ui.Chart.feature.byFeature(screeData, 'PC', 'Explained_Variance_Pct')
+  .setChartType('LineChart')
+  .setOptions({
+    title: 'Scree Plot - PCA Explained Variance',
+    titleTextStyle: {fontSize: 16, bold: true},
+    hAxis: {
+      title: 'Principal Component',
+      titleTextStyle: {fontSize: 14},
+      gridlines: {color: 'lightgray'},
+      minorGridlines: {color: 'lightgray', count: 0}
+    },
+    vAxis: {
+      title: 'Explained Variance (%)',
+      titleTextStyle: {fontSize: 14},
+      gridlines: {color: 'lightgray'},
+      minorGridlines: {color: 'lightgray', count: 4}
+    },
+    series: {
+      0: {
+        lineWidth: 3,
+        pointSize: 8,
+        color: '#1f77b4',
+        pointShape: 'circle'
+      }
+    },
+    legend: {position: 'none'},
+    backgroundColor: 'white',
+    width: 500,
+    height: 400
+  });
+
+print('Scree Plot:');
+print(screeChart);
+
+// Calculate cumulative explained variance
+var cumulative_pc1 = pc1_var;
+var cumulative_pc2 = pc1_var.add(pc2_var);
+var cumulative_pc3 = cumulative_pc2.add(pc3_var);
+var cumulative_pc4 = cumulative_pc3.add(pc4_var);
+
+print('Cumulative explained variance:');
+print('PC1:', cumulative_pc1, '%');
+print('PC1+PC2:', cumulative_pc2, '%');
+print('PC1+PC2+PC3:', cumulative_pc3, '%');
+print('All PCs:', cumulative_pc4, '%');
+
+// END OF SCRIPT WITH LANDSAT LST AND SCREE PLOT
