@@ -1,0 +1,804 @@
+/*******************************************************
+ RSEI (PCA) — SEASONAL ANALYSIS for Gazipur, Bangladesh
+ - Multi-year seasonal analysis with global min-max normalization BEFORE PCA
+ - Bangladesh seasons: Winter (Nov-Feb), Summer (Mar-May), Monsoon (Jun-Oct)
+ - Temporally consistent approach for accurate seasonal trend analysis
+ - Enhanced with complete visualization and proper area calculations
+ - Interactive UI controls for layer selection
+*******************************************************/
+
+// ----------------------------
+// PARAMETERS
+// ----------------------------
+var startYear = 2014;
+var endYear = 2024;
+var analysisScale = 90;
+var maxPixelsSample = 1000;
+
+// ----------------------------
+// 1) Load Gazipur AOI
+// ----------------------------
+var gaul = ee.FeatureCollection('FAO/GAUL/2015/level2');
+var gazipur = gaul.filter(ee.Filter.and(
+  ee.Filter.eq('ADM0_NAME', 'Bangladesh'),
+  ee.Filter.eq('ADM2_NAME', 'Gazipur')
+));
+
+Map.centerObject(gazipur, 10);
+Map.addLayer(gazipur.style({color: 'FF0000', width: 2}), {}, 'Gazipur');
+
+// ----------------------------
+// 2) Season Definition Functions
+// ----------------------------
+
+function getSeasonDates(year, season) {
+  var winterDates = {
+    start: ee.Date.fromYMD(year, 11, 1),
+    end: ee.Date.fromYMD(ee.Number(year).add(1), 2, 28)
+  };
+  
+  var summerDates = {
+    start: ee.Date.fromYMD(year, 3, 1),
+    end: ee.Date.fromYMD(year, 5, 31)
+  };
+  
+  var monsoonDates = {
+    start: ee.Date.fromYMD(year, 6, 1),
+    end: ee.Date.fromYMD(year, 10, 31)
+  };
+  
+  return ee.Algorithms.If(
+    ee.String(season).equals('Winter'), winterDates,
+    ee.Algorithms.If(
+      ee.String(season).equals('Summer'), summerDates,
+      ee.Algorithms.If(
+        ee.String(season).equals('Monsoon'), monsoonDates,
+        summerDates
+      )
+    )
+  );
+}
+
+// ----------------------------
+// 3) Processing functions
+// ----------------------------
+
+function maskL8sr(image) {
+  var qa = image.select('QA_PIXEL');
+  var mask = qa.bitwiseAnd(1 << 3).eq(0).and(qa.bitwiseAnd(1 << 4).eq(0));
+  return image.updateMask(mask);
+}
+
+function convertLandsatLST(image) {
+  return image.select('ST_B10')
+    .multiply(0.00341802).add(149.0).subtract(273.15)
+    .rename('LST').updateMask(image.select('QA_PIXEL').bitwiseAnd(1 << 3).eq(0));
+}
+
+function computeSeasonalIndicators(year, season) {
+  var dates = getSeasonDates(year, season);
+  var startDate = ee.Dictionary(dates).get('start');
+  var endDate = ee.Dictionary(dates).get('end');
+  
+  var l8sr = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+    .filterBounds(gazipur.geometry())
+    .filterDate(startDate, endDate)
+    .map(maskL8sr);
+  
+  var imageCount = l8sr.size();
+  var median = l8sr.median().clip(gazipur.geometry());
+  
+  var ndvi = median.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+  
+  var wet = median.expression(
+    '0.1511*B2 + 0.1973*B3 + 0.3283*B4 + 0.3407*B5 - 0.7117*B6 - 0.4559*B7', {
+      'B2': median.select('SR_B2'), 'B3': median.select('SR_B3'),
+      'B4': median.select('SR_B4'), 'B5': median.select('SR_B5'),
+      'B6': median.select('SR_B6'), 'B7': median.select('SR_B7')
+    }).rename('WET');
+  
+  var ndbi = median.normalizedDifference(['SR_B6', 'SR_B5']);
+  var bsi = median.expression('((B6+B4)-(B5+B2))/((B6+B4)+(B5+B2))', {
+    'B6': median.select('SR_B6'), 'B4': median.select('SR_B4'),
+    'B5': median.select('SR_B5'), 'B2': median.select('SR_B2')
+  });
+  var ndbsi = ndbi.add(bsi).multiply(0.5).rename('NDBSI');
+  
+  var lst = l8sr.map(convertLandsatLST).median().clip(gazipur.geometry());
+  
+  return ee.Image.cat([ndvi, wet, ndbsi, lst])
+    .rename(['NDVI', 'WET', 'NDBSI', 'LST'])
+    .set({'year': year, 'season': season, 'image_count': imageCount});
+}
+
+// ----------------------------
+// 4) STEP 1: Compute seasonal indicators
+// ----------------------------
+
+var years = ee.List.sequence(startYear, endYear);
+var seasons = ['Winter', 'Summer', 'Monsoon'];
+
+print('Step 1: Computing seasonal indicators...');
+
+var winterIndicators = years.map(function(year) {
+  return computeSeasonalIndicators(year, 'Winter');
+});
+
+var summerIndicators = years.map(function(year) {
+  return computeSeasonalIndicators(year, 'Summer');
+});
+
+var monsoonIndicators = years.map(function(year) {
+  return computeSeasonalIndicators(year, 'Monsoon');
+});
+
+var allSeasonalImages = winterIndicators.cat(summerIndicators).cat(monsoonIndicators);
+var seasonalCollection = ee.ImageCollection(allSeasonalImages);
+
+print('Seasonal indicator collection size:', seasonalCollection.size());
+
+// ----------------------------
+// 5) STEP 2: Calculate GLOBAL min-max
+// ----------------------------
+
+print('Step 2: Computing global min-max across all seasons and years...');
+
+var allSeasonsImage = seasonalCollection.toBands();
+
+var globalSample = allSeasonsImage.sample({
+  region: gazipur.geometry(),
+  scale: analysisScale,
+  numPixels: 2000,
+  seed: 42,
+  geometries: false
+});
+
+var bandNames = allSeasonsImage.bandNames();
+
+var ndviBands = bandNames.filter(ee.Filter.stringContains('item', 'NDVI'));
+var wetBands = bandNames.filter(ee.Filter.stringContains('item', 'WET'));
+var ndbsiBands = bandNames.filter(ee.Filter.stringContains('item', 'NDBSI'));
+var lstBands = bandNames.filter(ee.Filter.stringContains('item', 'LST'));
+
+function calculateIndicatorGlobalStats(sampleData, indicatorBands) {
+  var firstBand = ee.String(indicatorBands.get(0));
+  var allValues = sampleData.aggregate_array(firstBand);
+  
+  var combinedValues = indicatorBands.slice(1).iterate(function(bandName, acc) {
+    var bandValues = sampleData.aggregate_array(bandName);
+    return ee.List(acc).cat(bandValues);
+  }, allValues);
+  
+  var statsArray = ee.Array(combinedValues);
+  var minVal = statsArray.reduce(ee.Reducer.min(), [0]).get([0]);
+  var maxVal = statsArray.reduce(ee.Reducer.max(), [0]).get([0]);
+  
+  return ee.Dictionary({
+    'min': minVal,
+    'max': maxVal
+  });
+}
+
+var ndviStats = calculateIndicatorGlobalStats(globalSample, ndviBands);
+var wetStats = calculateIndicatorGlobalStats(globalSample, wetBands);
+var ndbsiStats = calculateIndicatorGlobalStats(globalSample, ndbsiBands);
+var lstStats = calculateIndicatorGlobalStats(globalSample, lstBands);
+
+var ndviGlobalMin = ndviStats.get('min');
+var ndviGlobalMax = ndviStats.get('max');
+var wetGlobalMin = wetStats.get('min');
+var wetGlobalMax = wetStats.get('max');
+var ndbsiGlobalMin = ndbsiStats.get('min');
+var ndbsiGlobalMax = ndbsiStats.get('max');
+var lstGlobalMin = lstStats.get('min');
+var lstGlobalMax = lstStats.get('max');
+
+var globalMins = ee.Image.constant([ndviGlobalMin, wetGlobalMin, ndbsiGlobalMin, lstGlobalMin])
+  .rename(['NDVI', 'WET', 'NDBSI', 'LST']);
+
+var globalMaxs = ee.Image.constant([ndviGlobalMax, wetGlobalMax, ndbsiGlobalMax, lstGlobalMax])
+  .rename(['NDVI', 'WET', 'NDBSI', 'LST']);
+
+var globalRanges = globalMaxs.subtract(globalMins);
+globalRanges = globalRanges.where(globalRanges.lte(0), ee.Image.constant(1));
+
+print('NDVI(Global_Min):', ee.Number(ndviGlobalMin));
+print('NDVI(Global_Max):', ee.Number(ndviGlobalMax));
+print('NDBSI (Global_Min):', ee.Number(ndbsiGlobalMin));
+print('NDBSI (Global_Max):', ee.Number(ndbsiGlobalMax));
+print('WET(Global_Min):', ee.Number(wetGlobalMin));
+print('WET(Global_Max):', ee.Number(wetGlobalMax));
+print('LST (Global_Min):', ee.Number(lstGlobalMin));
+print('LST (Global_Max):', ee.Number(lstGlobalMax));
+
+// ----------------------------
+// 6) STEP 3: Apply global normalization
+// ----------------------------
+
+print('Step 3: Applying global normalization to all seasonal data...');
+
+function globallyNormalizeSeasonalIndicators(indicatorImg) {
+  var year = indicatorImg.get('year');
+  var season = indicatorImg.get('season');
+  var normalized = indicatorImg.subtract(globalMins).divide(globalRanges).clamp(0, 1);
+  return normalized.set({'year': year, 'season': season});
+}
+
+var globallyNormalizedSeasonal = seasonalCollection.map(globallyNormalizeSeasonalIndicators);
+
+// ----------------------------
+// 7) STEP 4: Compute PCA transformation matrix
+// ----------------------------
+
+print('Step 4: Computing PCA matrix from Winter season reference...');
+
+var referenceNormalized = ee.Image(globallyNormalizedSeasonal
+  .filter(ee.Filter.eq('year', startYear))
+  .filter(ee.Filter.eq('season', 'Winter'))
+  .first());
+
+var refStats = referenceNormalized.reduceRegion({
+  reducer: ee.Reducer.mean(),
+  geometry: gazipur.geometry(),
+  scale: analysisScale,
+  maxPixels: 1e8,
+  bestEffort: true
+});
+
+var refMeans = ee.Image.constant([
+  refStats.get('NDVI'),
+  refStats.get('WET'), 
+  refStats.get('NDBSI'),
+  refStats.get('LST')
+]).rename(['NDVI', 'WET', 'NDBSI', 'LST']);
+
+var centeredRef = referenceNormalized.subtract(refMeans);
+
+var arrayImage = centeredRef.toArray();
+var covMatrix = arrayImage.reduceRegion({
+  reducer: ee.Reducer.centeredCovariance(),
+  geometry: gazipur.geometry(),
+  scale: analysisScale,
+  maxPixels: 1e8,
+  bestEffort: true
+});
+
+var covArray = ee.Array(covMatrix.get('array'));
+var eigens = covArray.eigen();
+var eigenVectors = eigens.slice(1, 1);
+var eigenValues = eigens.slice(1, 0, 1);
+
+var pc1Var = ee.Number(eigenValues.get([0, 0]));
+var pc2Var = ee.Number(eigenValues.get([1, 0]));
+var pc3Var = ee.Number(eigenValues.get([2, 0]));
+var pc4Var = ee.Number(eigenValues.get([3, 0]));
+
+var totalVar = eigenValues.reduce(ee.Reducer.sum(), [0]).get([0, 0]);
+
+var pc1ExplainedVar = pc1Var.divide(totalVar).multiply(100);
+var pc2ExplainedVar = pc2Var.divide(totalVar).multiply(100);
+var pc3ExplainedVar = pc3Var.divide(totalVar).multiply(100);
+var pc4ExplainedVar = pc4Var.divide(totalVar).multiply(100);
+
+print('PC1 Eigenvalue:', pc1Var, '| Explained Variance:', pc1ExplainedVar, '%');
+print('PC2 Eigenvalue:', pc2Var, '| Explained Variance:', pc2ExplainedVar, '%');
+print('PC3 Eigenvalue:', pc3Var, '| Explained Variance:', pc3ExplainedVar, '%');
+print('PC4 Eigenvalue:', pc4Var, '| Explained Variance:', pc4ExplainedVar, '%');
+
+var screeData = ee.FeatureCollection([
+  ee.Feature(null, {'PC': 1, 'Eigenvalue': pc1Var, 'Variance_Explained': pc1ExplainedVar}),
+  ee.Feature(null, {'PC': 2, 'Eigenvalue': pc2Var, 'Variance_Explained': pc2ExplainedVar}),
+  ee.Feature(null, {'PC': 3, 'Eigenvalue': pc3Var, 'Variance_Explained': pc3ExplainedVar}),
+  ee.Feature(null, {'PC': 4, 'Eigenvalue': pc4Var, 'Variance_Explained': pc4ExplainedVar})
+]);
+
+var screeChart = ui.Chart.feature.byFeature(screeData, 'PC', 'Variance_Explained')
+  .setChartType('LineChart')
+  .setOptions({
+    title: 'PCA Loading Factor Scree Plot - Variance Explained by Eigenvalues',
+    titleTextStyle: {fontSize: 14, bold: true},
+    hAxis: {title: 'Principal Component'},
+    vAxis: {title: 'Explained Variance'},
+    series: {0: {lineWidth: 3, pointSize: 8, color: '#1f77b4'}},
+    width: 500,
+    height: 350,
+    legend: {position: 'none'}
+  });
+
+print('PCA Scree Plot:');
+print(screeChart);
+
+var pc1Test = ee.Image(eigenVectors).matrixMultiply(centeredRef.toArray().toArray(1))
+  .arrayProject([0]).arrayFlatten([['PC1', 'PC2', 'PC3', 'PC4']]);
+
+var pc1Only = pc1Test.select('PC1');
+
+var correlationSample = pc1Only.addBands(referenceNormalized).sample({
+  region: gazipur.geometry(),
+  scale: analysisScale,
+  numPixels: 1000,
+  seed: 42,
+  geometries: false
+});
+
+var ndviCorr = correlationSample.reduceColumns(ee.Reducer.pearsonsCorrelation(), ['PC1', 'NDVI']);
+var wetCorr = correlationSample.reduceColumns(ee.Reducer.pearsonsCorrelation(), ['PC1', 'WET']);
+var ndbsiCorr = correlationSample.reduceColumns(ee.Reducer.pearsonsCorrelation(), ['PC1', 'NDBSI']);
+var lstCorr = correlationSample.reduceColumns(ee.Reducer.pearsonsCorrelation(), ['PC1', 'LST']);
+
+print('=== PC1 SEASONAL CORRELATION ANALYSIS ===');
+print('PC1-NDVI correlation:', ndviCorr.get('correlation'));
+print('PC1-WET correlation:', wetCorr.get('correlation'));
+print('PC1-NDBSI correlation:', ndbsiCorr.get('correlation'));
+print('PC1-LST correlation:', lstCorr.get('correlation'));
+
+var ndviFlip = ee.Number(ndviCorr.get('correlation')).lt(0);
+var wetFlip = ee.Number(wetCorr.get('correlation')).lt(0);
+var ndbsiFlip = ee.Number(ndbsiCorr.get('correlation')).gt(0);
+var lstFlip = ee.Number(lstCorr.get('correlation')).gt(0);
+
+var needsFlip = ndviFlip.or(wetFlip).or(ndbsiFlip).or(lstFlip);
+
+print('=== SEASONAL SIGN FLIP ANALYSIS ===');
+print('PC1 NEEDS SIGN FLIP:', needsFlip);
+
+// ----------------------------
+// 8) STEP 5: Apply PCA to all seasonal data
+// ----------------------------
+
+print('Step 5: Applying PCA to all seasonal data...');
+
+function applyPCAToSeasonalData(normalizedImg) {
+  var year = normalizedImg.get('year');
+  var season = normalizedImg.get('season');
+  
+  var centered = normalizedImg.subtract(refMeans);
+  var pcInput = centered.toArray().toArray(1);
+  var allPCs = ee.Image(eigenVectors).matrixMultiply(pcInput)
+    .arrayProject([0]).arrayFlatten([['PC1', 'PC2', 'PC3', 'PC4']]);
+  
+  var pc1 = allPCs.select('PC1');
+  
+  var rsei = ee.Algorithms.If(
+    needsFlip,
+    pc1.multiply(-1),
+    pc1
+  );
+  
+  return ee.Image(rsei).rename('RSEI_raw').set({'year': year, 'season': season});
+}
+
+var seasonalRSEIRaw = globallyNormalizedSeasonal.map(applyPCAToSeasonalData);
+
+// ----------------------------
+// 9) STEP 6: Final normalization
+// ----------------------------
+
+print('Step 6: Final seasonal RSEI normalization...');
+
+var rseiSeasonalSample = seasonalRSEIRaw.map(function(img) {
+  return img.sample({
+    region: gazipur.geometry(),
+    scale: analysisScale,
+    numPixels: 1000,
+    seed: 42,
+    geometries: false
+  });
+}).flatten();
+
+var rseiGlobalStats = rseiSeasonalSample.reduceColumns({
+  reducer: ee.Reducer.minMax(),
+  selectors: ['RSEI_raw']
+});
+
+var rseiMin = rseiGlobalStats.get('min');
+var rseiMax = rseiGlobalStats.get('max');
+var rseiRange = ee.Number(rseiMax).subtract(ee.Number(rseiMin));
+
+function finalNormalizeSeasonalRSEI(img) {
+  var year = img.get('year');
+  var season = img.get('season');
+  var normalized = img.select('RSEI_raw')
+    .subtract(ee.Number(rseiMin))
+    .divide(rseiRange)
+    .clamp(0, 1)
+    .rename('RSEI');
+  return normalized.set({'year': year, 'season': season});
+}
+
+var finalSeasonalRSEI = seasonalRSEIRaw.map(finalNormalizeSeasonalRSEI);
+
+// ----------------------------
+// 10) SEASONAL CATEGORIZATION AND AREA ANALYSIS
+// ----------------------------
+
+function categorizeSeasonalRSEI(rseiImg) {
+  var year = rseiImg.get('year');
+  var season = rseiImg.get('season');
+  var categorized = rseiImg.select('RSEI')
+    .where(rseiImg.select('RSEI').lte(0.2), 1)
+    .where(rseiImg.select('RSEI').gt(0.2).and(rseiImg.select('RSEI').lte(0.4)), 2)
+    .where(rseiImg.select('RSEI').gt(0.4).and(rseiImg.select('RSEI').lte(0.6)), 3)
+    .where(rseiImg.select('RSEI').gt(0.6).and(rseiImg.select('RSEI').lte(0.8)), 4)
+    .where(rseiImg.select('RSEI').gt(0.8), 5)
+    .rename('RSEI_Category');
+  
+  return categorized.set({'year': year, 'season': season});
+}
+
+var categorizedSeasonalRSEI = finalSeasonalRSEI.map(categorizeSeasonalRSEI);
+
+function calculateSeasonalCategoryAreasImproved(catImg) {
+  var year = catImg.get('year');
+  var season = catImg.get('season');
+  
+  var areaImage = ee.Image.pixelArea().divide(10000);
+  
+  var category1Area = areaImage.updateMask(catImg.select('RSEI_Category').eq(1))
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: gazipur.geometry(),
+      scale: analysisScale,
+      maxPixels: 1e8,
+      bestEffort: true
+    }).getNumber('area');
+    
+  var category2Area = areaImage.updateMask(catImg.select('RSEI_Category').eq(2))
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: gazipur.geometry(),
+      scale: analysisScale,
+      maxPixels: 1e8,
+      bestEffort: true
+    }).getNumber('area');
+    
+  var category3Area = areaImage.updateMask(catImg.select('RSEI_Category').eq(3))
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: gazipur.geometry(),
+      scale: analysisScale,
+      maxPixels: 1e8,
+      bestEffort: true
+    }).getNumber('area');
+    
+  var category4Area = areaImage.updateMask(catImg.select('RSEI_Category').eq(4))
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: gazipur.geometry(),
+      scale: analysisScale,
+      maxPixels: 1e8,
+      bestEffort: true
+    }).getNumber('area');
+    
+  var category5Area = areaImage.updateMask(catImg.select('RSEI_Category').eq(5))
+    .reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: gazipur.geometry(),
+      scale: analysisScale,
+      maxPixels: 1e8,
+      bestEffort: true
+    }).getNumber('area');
+  
+  var meanRSEI = catImg.select('RSEI_Category').unmask(0)
+    .reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: gazipur.geometry(),
+      scale: analysisScale,
+      maxPixels: 1e8,
+      bestEffort: true
+    }).getNumber('RSEI_Category');
+  
+  return ee.Feature(null, {
+    'Year': ee.Number(year).toInt(),
+    'Season': season,
+    'Year_Season': ee.String(ee.Number(year).format('%.0f')).cat('_').cat(season),
+    'Category_1_VeryPoor_ha': ee.Number(category1Area).toDouble(),
+    'Category_2_Poor_ha': ee.Number(category2Area).toDouble(),
+    'Category_3_Moderate_ha': ee.Number(category3Area).toDouble(),
+    'Category_4_Good_ha': ee.Number(category4Area).toDouble(),
+    'Category_5_Excellent_ha': ee.Number(category5Area).toDouble(),
+    'Mean_Category': ee.Number(meanRSEI).toDouble()
+  });
+}
+
+var seasonalCategoryAreas = categorizedSeasonalRSEI.map(calculateSeasonalCategoryAreasImproved);
+
+// ----------------------------
+// 11) COMPLETE VISUALIZATION
+// ----------------------------
+
+var rseiPalette = ['#8B0000', '#FF4500', '#FFD700', '#ADFF2F', '#228B22'];
+var categoryPalette = ['#8B0000', '#FF4500', '#FFD700', '#9ACD32', '#228B22'];
+
+years.getInfo().forEach(function(year) {
+  seasons.forEach(function(season) {
+    var rseiImg = finalSeasonalRSEI
+      .filter(ee.Filter.eq('year', year))
+      .filter(ee.Filter.eq('season', season))
+      .first();
+    
+    var categoryImg = categorizedSeasonalRSEI
+      .filter(ee.Filter.eq('year', year))
+      .filter(ee.Filter.eq('season', season))
+      .first();
+    
+    var layerName = year + ' ' + season;
+    var categoryLayerName = year + ' ' + season + ' Categories';
+    
+    var showLayer = (year === endYear && season === 'Winter');
+    Map.addLayer(rseiImg, {min: 0, max: 1, palette: rseiPalette}, layerName + ' RSEI', showLayer);
+    Map.addLayer(categoryImg, {min: 1, max: 5, palette: categoryPalette}, categoryLayerName, false);
+  });
+});
+
+// ----------------------------
+// 12) SEASONAL CHARTS
+// ----------------------------
+
+var seasonalTimeSeries = finalSeasonalRSEI.map(function(img) {
+  var year = img.get('year');
+  var season = img.get('season');
+  var meanRSEI = img.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: gazipur.geometry(),
+    scale: analysisScale,
+    maxPixels: 1e8,
+    bestEffort: true
+  });
+  
+  return ee.Feature(null, {
+    'year': year,
+    'season': season,
+    'year_season': ee.String(ee.Number(year).format('%.0f')).cat('_').cat(season),
+    'mean_RSEI': meanRSEI.get('RSEI')
+  });
+});
+
+var seasonalChart = ui.Chart.feature.groups(seasonalTimeSeries, 'year', 'mean_RSEI', 'season')
+  .setChartType('LineChart')
+  .setOptions({
+    title: 'Seasonal RSEI Trends - Gazipur, Bangladesh',
+    titleTextStyle: {fontSize: 16, bold: true},
+    hAxis: {title: 'Year', format: '####'},
+    vAxis: {title: 'Mean RSEI', viewWindow: {min: 0, max: 1}},
+    series: {
+      0: {lineWidth: 3, pointSize: 6, color: '#1E88E5'},
+      1: {lineWidth: 3, pointSize: 6, color: '#FFC107'},
+      2: {lineWidth: 3, pointSize: 6, color: '#4CAF50'}
+    },
+    width: 700,
+    height: 450
+  });
+
+print('Seasonal RSEI Trends Chart:');
+print(seasonalChart);
+
+// ----------------------------
+// 13) CSV EXPORT
+// ----------------------------
+
+Export.table.toDrive({
+  collection: seasonalCategoryAreas,
+  description: 'Gazipur_Seasonal_RSEI_Areas_2023_2024',
+  fileFormat: 'CSV',
+  folder: 'GEE_RSEI_Analysis',
+  selectors: ['Year', 'Season', 'Year_Season', 'Category_1_VeryPoor_ha', 'Category_2_Poor_ha', 
+             'Category_3_Moderate_ha', 'Category_4_Good_ha', 'Category_5_Excellent_ha', 'Mean_Category']
+});
+
+Export.table.toDrive({
+  collection: seasonalTimeSeries,
+  description: 'Gazipur_Seasonal_RSEI_TimeSeries_2023_2024',
+  fileFormat: 'CSV',
+  folder: 'GEE_RSEI_Analysis',
+  selectors: ['year', 'season', 'year_season', 'mean_RSEI']
+});
+
+var summaryStats = seasonalCategoryAreas.map(function(feature) {
+  var year = feature.get('Year');
+  var season = feature.get('Season');
+  var cat1 = ee.Number(feature.get('Category_1_VeryPoor_ha'));
+  var cat2 = ee.Number(feature.get('Category_2_Poor_ha'));
+  var cat3 = ee.Number(feature.get('Category_3_Moderate_ha'));
+  var cat4 = ee.Number(feature.get('Category_4_Good_ha'));
+  var cat5 = ee.Number(feature.get('Category_5_Excellent_ha'));
+  
+  var totalArea = cat1.add(cat2).add(cat3).add(cat4).add(cat5);
+  var poorArea = cat1.add(cat2);
+  var goodArea = cat4.add(cat5);
+  
+  var poorPercent = poorArea.divide(totalArea).multiply(100);
+  var moderatePercent = cat3.divide(totalArea).multiply(100);
+  var goodPercent = goodArea.divide(totalArea).multiply(100);
+  
+  return ee.Feature(null, {
+    'Year': year,
+    'Season': season,
+    'Total_Area_ha': totalArea,
+    'Poor_Combined_ha': poorArea,
+    'Moderate_ha': cat3,
+    'Good_Combined_ha': goodArea,
+    'Poor_Percent': poorPercent,
+    'Moderate_Percent': moderatePercent,
+    'Good_Percent': goodPercent
+  });
+});
+
+Export.table.toDrive({
+  collection: summaryStats,
+  description: 'Gazipur_Seasonal_RSEI_Summary_2023_2024',
+  fileFormat: 'CSV',
+  folder: 'GEE_RSEI_Analysis'
+});
+
+// ----------------------------
+// COMBINED CONTROL PANEL WITH LEGEND
+// ----------------------------
+
+// ----------------------------
+// COMBINED CONTROL PANEL WITH LEGEND
+// ----------------------------
+
+var controlPanel = ui.Panel({
+  style: {
+    position: 'top-left',
+    padding: '8px 15px',
+    width: '280px'
+  }
+});
+
+// Title
+var controlTitle = ui.Label({
+  value: 'RSEI Layer Controls',
+  style: {fontWeight: 'bold', fontSize: '16px', margin: '0 0 15px 0'}
+});
+controlPanel.add(controlTitle);
+
+// Year Selection
+var yearLabel = ui.Label('Select Year:', {margin: '2px 0 5px 0'});
+controlPanel.add(yearLabel);
+
+var yearList = [];
+for (var y = startYear; y <= endYear; y++) {
+  yearList.push(y.toString());
+}
+
+var yearSelect = ui.Select({
+  items: yearList,
+  value: endYear.toString(),
+  style: {stretch: 'horizontal'},
+  onChange: function(year) {
+    updateMapLayers(parseInt(year), seasonSelect.getValue());
+  }
+});
+controlPanel.add(yearSelect);
+
+// Season Selection
+var seasonLabel = ui.Label('Select Season:', {margin: '2px 0 5px 0'});
+controlPanel.add(seasonLabel);
+
+var seasonSelect = ui.Select({
+  items: ['Winter', 'Summer', 'Monsoon'],
+  value: 'Winter',
+  style: {stretch: 'horizontal'},
+  onChange: function(season) {
+    updateMapLayers(parseInt(yearSelect.getValue()), season);
+  }
+});
+controlPanel.add(seasonSelect);
+
+// Layer Type Selection
+var layerTypeLabel = ui.Label('Layer Type:', {margin: '2px 0 5px 0'});
+controlPanel.add(layerTypeLabel);
+
+var layerTypeSelect = ui.Select({
+  items: ['RSEI Continuous', 'RSEI Categories', 'Both'],
+  value: 'RSEI Continuous',
+  style: {stretch: 'horizontal'},
+  onChange: function(layerType) {
+    updateMapLayers(parseInt(yearSelect.getValue()), seasonSelect.getValue());
+  }
+});
+controlPanel.add(layerTypeSelect);
+
+// Divider
+var divider = ui.Label({
+  value: '────────────────',
+  style: {margin: '15px 0 10px 0', color: '#ccc', textAlign: 'center'}
+});
+controlPanel.add(divider);
+
+// Legend Section
+var legendTitle = ui.Label({
+  value: 'RSEI Categories',
+  style: {fontWeight: 'bold', fontSize: '14px', margin: '0 0 8px 0', padding: '0'}
+});
+controlPanel.add(legendTitle);
+
+var analysisInfo = ui.Label({
+  value: 'Years: ' + startYear + '-' + endYear + '\nSeasons: Winter, Summer, Monsoon',
+  style: {fontSize: '11px', margin: '0 0 12px 0', padding: '0', color: '#666'}
+});
+controlPanel.add(analysisInfo);
+
+// Legend Items
+var categories = [
+  'Very Poor (0.0-0.2)', 
+  'Poor (0.2-0.4)', 
+  'Moderate (0.4-0.6)', 
+  'Good (0.6-0.8)', 
+  'Excellent (0.8-1.0)'
+];
+var colors = ['#8B0000', '#FF4500', '#FFD700', '#9ACD32', '#228B22'];
+
+// Add legend items directly to controlPanel
+categories.forEach(function(category, index) {
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: colors[index],
+      padding: '8px',
+      margin: '0 0 4px 0',
+      stretch: 'vertical'
+    }
+  });
+  var description = ui.Label({
+    value: category,
+    style: {margin: '0 0 4px 6px', fontSize: '11px'}
+  });
+  
+  // Create a horizontal panel for each legend item and add to controlPanel
+  var legendItem = ui.Panel([colorBox, description], ui.Panel.Layout.Flow('horizontal'));
+  controlPanel.add(legendItem);
+});
+
+// Info text
+var infoLabel = ui.Label({
+  value: 'Use dropdowns to explore different years and seasons.',
+  style: {fontSize: '11px', margin: '15px 0 0 0', color: '#666', whiteSpace: 'pre-wrap'}
+});
+controlPanel.add(infoLabel);
+
+// Add to map
+Map.add(controlPanel);
+
+// Layer update function
+function updateMapLayers(year, season) {
+  var layerType = layerTypeSelect.getValue();
+  var layers = Map.layers();
+  
+  // Hide all RSEI layers
+  for (var i = 0; i < layers.length(); i++) {
+    var layer = layers.get(i);
+    var layerName = layer.getName();
+    
+    if (layerName.indexOf('RSEI') > -1 || layerName.indexOf('Categories') > -1) {
+      layer.setShown(false);
+    }
+  }
+  
+  // Show selected layers
+  var targetRSEI = year + ' ' + season + ' RSEI';
+  var targetCategories = year + ' ' + season + ' Categories';
+  
+  for (var i = 0; i < layers.length(); i++) {
+    var layer = layers.get(i);
+    var layerName = layer.getName();
+    
+    if (layerType === 'RSEI Continuous' && layerName === targetRSEI) {
+      layer.setShown(true);
+    } else if (layerType === 'RSEI Categories' && layerName === targetCategories) {
+      layer.setShown(true);
+    } else if (layerType === 'Both') {
+      if (layerName === targetRSEI || layerName === targetCategories) {
+        layer.setShown(true);
+      }
+    }
+  }
+}
+// ----------------------------
+// 16) FINAL SUMMARY
+// ----------------------------
+
+print('=== ENHANCED SEASONAL RSEI ANALYSIS COMPLETE ===');
+print('Years processed:', startYear, 'to', endYear);
+print('Total maps created:', (endYear - startYear + 1) * 3 * 2);
