@@ -1,0 +1,363 @@
+/************************************************************************************
+* LST Downscaling — Khulna District, Bangladesh (GAUL 2015 L2)
+* Adds: Regression fit chart, TsHARP @10 m, Thermal pan-sharpening @15 m (+ fallback)
+* Notes: Q–Q & Moran’s I are not native in GEE; export residuals as CSV for Python/R.
+************************************************************************************/
+
+// ============================== START: REGION (GAUL L2) ============================
+var gaul2 = ee.FeatureCollection('FAO/GAUL/2015/level2');
+var khulna = gaul2
+  .filter(ee.Filter.eq('ADM0_NAME', 'Bangladesh'))
+  .filter(ee.Filter.eq('ADM2_NAME', 'Khulna'))
+  .geometry();
+Map.centerObject(khulna, 9);
+// =============================== END: REGION (GAUL L2) =============================
+
+
+
+// ========================= START: DATA — Landsat 8/9 L2 ===========================
+var start = '2024-01-01';
+var end   = '2024-12-31';
+
+var L8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+  .filterDate(start, end)
+  .filterBounds(khulna)
+  .filter(ee.Filter.eq('CLOUD_COVER', 0));
+
+var L9 = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+  .filterDate(start, end)
+  .filterBounds(khulna)
+  .filter(ee.Filter.eq('CLOUD_COVER', 0));
+
+var LS = L8.merge(L9).sort('system:time_start');
+var L_image = ee.Image(LS.first());
+print('Chosen Landsat L2 image (2024, cloud=0):', L_image.id());
+// ========================== END: DATA — Landsat 8/9 L2 ============================
+
+
+
+// ======================== START: DATA — Sentinel-2 SR ==============================
+var S2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(khulna)
+  .filterDate(start, end)
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 10))
+  // Homogenize schema: select only reflectance bands used later
+  .select(['B2','B3','B4','B8','B11']);
+
+var S2_image = S2.median(); // per-pixel median composite
+// ========================= END: DATA — Sentinel-2 SR ===============================
+
+
+
+// ============================= START: SCALE FACTORS ================================
+function scaleLandsatL2(img) {
+  var sr  = img.select('SR_B.*').multiply(0.0000275).add(-0.2);                    // reflectance [0–1]
+  var stC = img.select('ST_B.*').multiply(0.00341802).add(149.0).subtract(273.15); // °C
+  return img.addBands(sr, null, true).addBands(stC, null, true);
+}
+function scaleS2(img) { return img.divide(10000); }
+
+L_image  = scaleLandsatL2(L_image).clip(khulna);
+S2_image = scaleS2(S2_image).clip(khulna);
+// ============================== END: SCALE FACTORS =================================
+
+
+
+// ============================ START: INDICES & LST =================================
+// Landsat (30 m)
+var L_NDVI = L_image.normalizedDifference(['SR_B5','SR_B4']).rename('L_NDVI');
+var L_NDWI = L_image.normalizedDifference(['SR_B3','SR_B5']).rename('L_NDWI');
+var L_NDBI = L_image.normalizedDifference(['SR_B6','SR_B5']).rename('L_NDBI');
+var L_LST  = L_image.select('ST_B10').rename('L_LST'); // °C
+
+// Sentinel-2 (10 m)
+var S2_NDVI = S2_image.normalizedDifference(['B8','B4']).rename('S2_NDVI');
+var S2_NDWI = S2_image.normalizedDifference(['B3','B11']).rename('S2_NDWI');
+var S2_NDBI = S2_image.normalizedDifference(['B11','B8']).rename('S2_NDBI');
+// ============================= END: INDICES & LST ==================================
+
+
+
+// ======================== START: MULTI-INDEX REGRESSION (30 m) =====================
+var X = ee.Image(1).rename('constant')
+  .addBands(L_NDVI).addBands(L_NDBI).addBands(L_NDWI); // order: const, NDVI, NDBI, NDWI
+var Y = L_LST;
+
+var reg = X.addBands(Y).reduceRegion({
+  reducer: ee.Reducer.linearRegression({numX: 4, numY: 1}),
+  geometry: khulna, scale: 30, maxPixels: 1e10, bestEffort: true
+});
+print('Linear regression (dict):', reg);
+
+// Coefficients (order: const, NDVI, NDBI, NDWI)
+var coefArr = ee.Array(reg.get('coefficients'));
+var b0    = ee.Number(coefArr.get([0, 0]));
+var bNDVI = ee.Number(coefArr.get([1, 0]));
+var bNDBI = ee.Number(coefArr.get([2, 0]));
+var bNDWI = ee.Number(coefArr.get([3, 0]));
+print('Equation: LST =', b0, '+', bNDVI, '*NDVI +', bNDBI, '*NDBI +', bNDWI, '*NDWI');
+
+// Landsat-scale model & residuals (image-first to carry projection)
+var L_model = L_NDVI.multiply(bNDVI)
+  .add(L_NDBI.multiply(bNDBI))
+  .add(L_NDWI.multiply(bNDWI))
+  .add(b0)
+  .rename('L_model');
+
+var residuals = L_LST.subtract(L_model).rename('residuals');
+// ========================= END: MULTI-INDEX REGRESSION (30 m) ======================
+
+
+
+// ===================== START: REGRESSION FIT CHART (Observed vs Pred) =============
+var fitSamples = L_LST.addBands(L_model).sample({
+  region: khulna, scale: 30, numPixels: 5000, seed: 123, geometries: false
+});
+var fitChart = ui.Chart.feature.byFeature(fitSamples, 'L_model', ['L_LST'])
+  .setChartType('ScatterChart')
+  .setOptions({
+    title: 'Regression fit: Observed (LST) vs Predicted (Model) — 30 m',
+    hAxis: {title: 'Predicted LST (°C)'},
+    vAxis: {title: 'Observed LST (°C)'},
+    pointSize: 2,
+    trendlines: {0: {showR2: true, type: 'linear'}}
+  });
+print(fitChart);
+// ====================== END: REGRESSION FIT CHART (Observed vs Pred) ===============
+
+
+
+// =================== START: PRE-DOWNSCALE DIAGNOSTICS (30 m) ======================
+function regionStats(obs, pred, geom, scale) {
+  var diff = obs.subtract(pred).rename('diff');
+
+  var meanDiff = diff.reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: geom, scale: scale, maxPixels: 1e10, bestEffort: true
+  }).get('diff');
+
+  var mse = diff.pow(2).reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: geom, scale: scale, maxPixels: 1e10, bestEffort: true
+  }).get('diff');
+  var rmse = ee.Number(mse).sqrt();
+
+  var obsMean = obs.reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: geom, scale: scale, maxPixels: 1e10, bestEffort: true
+  }).get(obs.bandNames().get(0));
+
+  var sse = diff.pow(2).reduceRegion({
+    reducer: ee.Reducer.sum(), geometry: geom, scale: scale, maxPixels: 1e10, bestEffort: true
+  }).get('diff');
+
+  var sst = obs.subtract(ee.Number(obsMean)).pow(2).reduceRegion({
+    reducer: ee.Reducer.sum(), geometry: geom, scale: scale, maxPixels: 1e10, bestEffort: true
+  }).get(obs.bandNames().get(0));
+
+  var r2 = ee.Number(1).subtract(ee.Number(sse).divide(ee.Number(sst)));
+
+  return ee.Dictionary({mean_bias: meanDiff, RMSE: rmse, R2: r2});
+}
+print('Pre-downscale metrics (30 m):', regionStats(L_LST, L_model, khulna, 30));
+
+// Residual histogram (pre)
+var hist = ui.Chart.image.histogram({image: residuals, region: khulna, scale: 30, maxPixels: 1e7})
+  .setOptions({title: 'Residuals Histogram (pre-downscale, 30 m)',
+               hAxis: {title: 'Residual (°C)'}, vAxis: {title: 'Count'}});
+print(hist);
+
+// Simple CV: predict test split with global coefficients
+var trainingImg = L_LST.addBands([L_NDVI, L_NDBI, L_NDWI]).rename(['LST','NDVI','NDBI','NDWI']);
+var samples = trainingImg.sample({region: khulna, scale: 30, numPixels: 5000, seed: 42, geometries: false})
+  .randomColumn('rand', 42);
+var test  = samples.filter(ee.Filter.gte('rand', 0.7));
+
+var testPred = test.map(function(ft){
+  var yhat = b0
+    .add(bNDVI.multiply(ee.Number(ft.get('NDVI'))))
+    .add(bNDBI.multiply(ee.Number(ft.get('NDBI'))))
+    .add(bNDWI.multiply(ee.Number(ft.get('NDWI'))));
+  return ft.set('pred', yhat);
+});
+var testDiff = testPred.map(function(ft){
+  var d = ee.Number(ft.get('LST')).subtract(ee.Number(ft.get('pred')));
+  return ft.set('diff', d).set('diff2', d.multiply(d));
+});
+var testBias = ee.Number(testDiff.reduceColumns(ee.Reducer.mean(), ['diff']).get('mean'));
+var testMSE  = ee.Number(testDiff.reduceColumns(ee.Reducer.mean(), ['diff2']).get('mean'));
+var testRMSE = testMSE.sqrt();
+print('Cross-validation (70/30) — RMSE, Bias (°C):', testRMSE, testBias);
+// ==================== END: PRE-DOWNSCALE DIAGNOSTICS (30 m) ========================
+
+
+
+// ==================== START: RESIDUAL SMOOTHING & PROJECTIONS ======================
+var gauss = ee.Kernel.gaussian({radius: 1.5, units: 'pixels'});
+var residSmooth = residuals.resample('bicubic').convolve(gauss).rename('residSmooth');
+
+var tenProj  = S2_NDVI.projection();
+var tenCrs   = tenProj.crs();
+var tenScale = tenProj.nominalScale();
+
+// Put residuals on exact S2 10 m grid (no .resample('nearest') needed)
+var residSmooth10 = residSmooth
+  .setDefaultProjection(L_LST.projection())     // ensure a valid default
+  .reproject({crs: tenCrs, scale: tenScale});
+// ===================== END: RESIDUAL SMOOTHING & PROJECTIONS =======================
+
+
+
+// ================== START: MULTI-INDEX DOWNSCALING TO 10 m =========================
+var S2_pred10 = S2_NDVI.multiply(bNDVI)
+  .add(S2_NDBI.multiply(bNDBI))
+  .add(S2_NDWI.multiply(bNDWI))
+  .add(b0)
+  .rename('S2_pred10')
+  .setDefaultProjection(tenCrs, null, tenScale);
+
+var LST10_noRes   = S2_pred10.rename('LST10_noRes').setDefaultProjection(tenCrs, null, tenScale);
+var LST10_withRes = S2_pred10.add(residSmooth10).rename('LST10_withRes')
+  .setDefaultProjection(tenCrs, null, tenScale);
+// =================== END: MULTI-INDEX DOWNSCALING TO 10 m ==========================
+
+
+
+// =========== START: POST-DOWNSCALE — ENERGY CONSISTENCY (10→30 m) =================
+function aggToTemplate(imgFine, templateCoarse) {
+  var projC = templateCoarse.projection();
+  return imgFine
+    .reduceResolution({reducer: ee.Reducer.mean(), maxPixels: 2048})
+    .reproject({crs: projC});
+}
+var LST10_withRes_30 = aggToTemplate(LST10_withRes, L_LST);
+var LST10_noRes_30   = aggToTemplate(LST10_noRes,   L_LST);
+
+print('Post-downscale metrics (with residuals, 10→30 m):',
+  regionStats(L_LST, LST10_withRes_30, khulna, 30));
+print('Post-downscale metrics (no residuals, 10→30 m):',
+  regionStats(L_LST, LST10_noRes_30, khulna, 30));
+// ============ END: POST-DOWNSCALE — ENERGY CONSISTENCY (10→30 m) ==================
+
+
+
+// ======================== START: TsHARP (NDVI-based, 10 m) =========================
+// Fit LST ~ NDVI at 30 m
+var regTs = ee.Dictionary(L_NDVI.addBands(L_LST).reduceRegion({
+  reducer: ee.Reducer.linearFit(), geometry: khulna, scale: 30, maxPixels: 1e10, bestEffort: true
+}));
+// linearFit returns {scale: slope, offset: intercept}
+var bTs = ee.Number(regTs.get('scale'));
+var aTs = ee.Number(regTs.get('offset'));
+print('TsHARP linear (LST = a + b*NDVI): a =', aTs, ', b =', bTs);
+
+// Predict at 10 m (initial)
+var Ts10_init = S2_NDVI.multiply(bTs).add(aTs).rename('TsHARP10_init')
+  .setDefaultProjection(tenCrs, null, tenScale);
+
+// Energy conservation: bias per 30 m pixel, expressed on 10 m grid
+var Ts10_30    = aggToTemplate(Ts10_init, L_LST);
+var Ts_delta30 = L_LST.subtract(Ts10_30).rename('Ts_delta30');
+var Ts_delta10 = Ts_delta30
+  .setDefaultProjection(L_LST.projection())
+  .reproject({crs: tenCrs, scale: tenScale});
+
+var TsHARP10 = Ts10_init.add(Ts_delta10).rename('TsHARP10')
+  .setDefaultProjection(tenCrs, null, tenScale);
+
+// Diagnostics for TsHARP
+var TsHARP10_30 = aggToTemplate(TsHARP10, L_LST);
+print('TsHARP post metrics (10→30 m):', regionStats(L_LST, TsHARP10_30, khulna, 30));
+
+var fitTsSamples = L_LST.addBands(TsHARP10_30.rename('TsHARP_agg')).sample({
+  region: khulna, scale: 30, numPixels: 5000, seed: 77
+});
+var chartTs = ui.Chart.feature.byFeature(fitTsSamples, 'TsHARP_agg', ['L_LST'])
+  .setChartType('ScatterChart')
+  .setOptions({title: 'Fit: Landsat LST vs TsHARP (10→30 m)',
+               hAxis:{title:'TsHARP (°C)'}, vAxis:{title:'Landsat LST (°C)'},
+               pointSize:2, trendlines:{0:{showR2:true}}});
+print(chartTs);
+// ========================= END: TsHARP (NDVI-based, 10 m) ==========================
+
+
+
+// =================== START: THERMAL PAN-SHARPENING (15 m) ==========================
+/* Primary: use real L8 PAN (15 m) from C02 T1 TOA near the L2 date (±1 day).
+   Fallback: synthetic PAN from S2 luminance at 10 m, reprojected to 15 m. */
+
+var L_date = ee.Date(L_image.get('system:time_start'));
+var L1_TOA = ee.ImageCollection('LANDSAT/LC08/C02/T1_TOA')
+  .filterBounds(khulna)
+  .filterDate(L_date.advance(-1, 'day'), L_date.advance(1, 'day'))
+  .sort('system:time_start')
+  .first();
+
+// Build fallback synthetic PAN (S2 luminance at 10 m → 15 m grid)
+var lum10 = S2_image.select(['B2','B3','B4']).reduce(ee.Reducer.mean()).rename('Lum10');
+var fallbackPan15 = lum10.reproject({crs: tenCrs, scale: 15}).rename('Pan15_fallback');
+
+// Choose PAN image (server-side)
+var Pan15 = ee.Image(ee.Algorithms.If(L1_TOA,
+  ee.Image(L1_TOA).select('B8').clip(khulna),    // real PAN
+  fallbackPan15                                   // synthetic PAN
+));
+var panNote = ee.Algorithms.If(L1_TOA,
+  'Using Landsat-8 PAN (15 m)',
+  'Fallback: Synthetic PAN from S2 luminance (15 m)'
+);
+print('Thermal pan-sharpening path:', panNote);
+
+// Projection info
+var PanProj  = Pan15.projection();
+var PanCrs   = PanProj.crs();
+var PanScale = PanProj.nominalScale();
+
+// 30 m version of PAN predictor (mean within Landsat pixels)
+var Pan30 = Pan15.reduceResolution({reducer: ee.Reducer.mean(), maxPixels: 4096})
+                 .reproject({crs: L_LST.projection()});
+
+// Regress LST ~ Pan30 @ 30 m
+var regPan = ee.Dictionary(Pan30.addBands(L_LST).reduceRegion({
+  reducer: ee.Reducer.linearFit(), geometry: khulna, scale: 30, maxPixels: 1e10, bestEffort: true
+}));
+var bPan = ee.Number(regPan.get('scale'));
+var aPan = ee.Number(regPan.get('offset'));
+print('Pan-sharpen linear (LST = a + b*PAN): a =', aPan, ', b =', bPan);
+
+// Predict at 15 m (initial)
+var LST_pan15_init = Pan15.multiply(bPan).add(aPan).rename('LST_pan15_init')
+  .setDefaultProjection(PanCrs, null, PanScale);
+
+// Energy conservation: per-30 m bias → 15 m grid
+var LST_pan15_30 = aggToTemplate(LST_pan15_init, L_LST);
+var Pan_delta30  = L_LST.subtract(LST_pan15_30).rename('Pan_delta30');
+var Pan_delta15  = Pan_delta30
+  .setDefaultProjection(L_LST.projection())
+  .reproject({crs: PanCrs, scale: PanScale});
+
+var LST_pan15 = LST_pan15_init.add(Pan_delta15).rename('LST_pan15')
+  .setDefaultProjection(PanCrs, null, PanScale);
+
+// Diagnostics for PAN method
+var LST_pan15_30_adj = aggToTemplate(LST_pan15, L_LST);
+print('Pan-sharpen post metrics (15→30 m):', regionStats(L_LST, LST_pan15_30_adj, khulna, 30));
+
+var fitPanSamples = L_LST.addBands(LST_pan15_30_adj.rename('Pan_agg')).sample({
+  region: khulna, scale: 30, numPixels: 5000, seed: 88
+});
+var chartPan = ui.Chart.feature.byFeature(fitPanSamples, 'Pan_agg', ['L_LST'])
+  .setChartType('ScatterChart')
+  .setOptions({title: 'Fit: Landsat LST vs Pan-sharpen (15→30 m)',
+               hAxis:{title:'Pan (°C)'}, vAxis:{title:'Landsat LST (°C)'},
+               pointSize:2, trendlines:{0:{showR2:true}}});
+print(chartPan);
+// ==================== END: THERMAL PAN-SHARPENING (15 m) ===========================
+
+
+
+// ============================== START: MAP LAYERS (QA) =============================
+Map.addLayer(L_LST,         {min: 20, max: 45, palette: ['blue','cyan','yellow','orange','red']}, 'Landsat LST (30 m)', false);
+Map.addLayer(L_model,       {min: 20, max: 45, palette: ['blue','cyan','yellow','orange','red']}, 'LST Model (30 m)', false);
+Map.addLayer(residuals,     {min: -5, max: 5,  palette: ['#2166ac','#f7f7f7','#b2182b']},          'Residuals (30 m)', false);
+Map.addLayer(LST10_withRes, {min: 20, max: 45, palette: ['blue','cyan','yellow','orange','red']}, 'Multi-index LST (10 m, +resid)', true);
+Map.addLayer(TsHARP10,      {min: 20, max: 45, palette: ['blue','cyan','yellow','orange','red']}, 'TsHARP LST (10 m)', false);
+Map.addLayer(LST_pan15,     {min: 20, max: 45, palette: ['blue','cyan','yellow','orange','red']}, 'Pan-sharp LST (15 m)', false);
+// =============================== END: MAP LAYERS (QA) ==============================
