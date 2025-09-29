@@ -1,0 +1,254 @@
+/**********************
+* LST Downscaling Workflow — Khulna District, Bangladesh (GAUL 2015 L2)
+* Notes:
+* - Q–Q plot & Moran’s I not native in GEE; export samples for Python/R.
+* - Uses 2024 temporal window (adjust if you prefer tighter pairing).
+**********************/
+
+// -------------------- 0) REGION: GAUL 2015 L2 → Khulna District -------------------- var gaul2 = ee.FeatureCollection('FAO/GAUL/2015/level2'); var khulna = gaul2 .filter(ee.Filter.eq('ADM0_NAME', 'Bangladesh')) .filter(ee.Filter.eq('ADM2_NAME', 'Khulna')) // District .geometry(); Map.centerObject(khulna, 9);
+
+// -------------------- 1) DATA: Landsat 8/9 L2 (2024; CLOUD_COVER=0) ----------------
+var start = '2024-01-01';
+var end   = '2024-12-31';
+
+var L8 = ee.ImageCollection('LANDSAT/LC08/C02/T1_L2')
+  .filterDate(start, end)
+  .filterBounds(khulna)
+  .filter(ee.Filter.eq('CLOUD_COVER', 0));
+
+var L9 = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+  .filterDate(start, end)
+  .filterBounds(khulna)
+  .filter(ee.Filter.eq('CLOUD_COVER', 0));
+
+var LS = L8.merge(L9).sort('system:time_start');   // corrected property name
+var L_image = ee.Image(LS.first());                // Select first cloud-free image
+print('Chosen Landsat image (2024, cloud=0):', L_image.id());
+
+// -------------------- 2) DATA: Sentinel-2 SR (2024 median composite) ----------------
+var S2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+  .filterBounds(khulna)
+  .filterDate(start, end)
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', 10))
+  .select(['B2','B3','B4','B8','B11']);
+
+var S2_image = S2.median(); // composite (per-pixel median)
+
+// -------------------- 3) SCALE FACTORS ---------------------------------------------
+function scaleLandsatL2(img) {
+  // Landsat Collection 2 Level-2 scaling
+  var sr  = img.select('SR_B.*').multiply(0.0000275).add(-0.2);                  // reflectance 0–1
+  var stC = img.select('ST_B.*').multiply(0.00341802).add(149.0).subtract(273.15); // °C
+  return img.addBands(sr, null, true).addBands(stC, null, true);
+}
+
+function scaleS2(img) {
+  // S2_SR bands stored as int scaled by 10000
+  return img.divide(10000);
+}
+
+L_image  = scaleLandsatL2(L_image).clip(khulna);
+S2_image = scaleS2(S2_image).clip(khulna);
+
+// -------------------- 4) INDICES & LST ---------------------------------------------
+// Landsat (30 m)
+var L_NDVI = L_image.normalizedDifference(['SR_B5','SR_B4']).rename('L_NDVI');
+var L_NDWI = L_image.normalizedDifference(['SR_B3','SR_B5']).rename('L_NDWI');
+var L_NDBI = L_image.normalizedDifference(['SR_B6','SR_B5']).rename('L_NDBI');
+var L_LST  = L_image.select('ST_B10').rename('L_LST'); // °C
+
+// Sentinel-2 (10 m)
+var S2_NDVI = S2_image.normalizedDifference(['B8','B4']).rename('S2_NDVI');
+var S2_NDWI = S2_image.normalizedDifference(['B3','B11']).rename('S2_NDWI');
+var S2_NDBI = S2_image.normalizedDifference(['B11','B8']).rename('S2_NDBI');
+
+// -------------------- 5) REGRESSION (LST ~ NDVI + NDBI + NDWI) @ 30 m --------------
+var X = ee.Image(1).rename('constant')
+  .addBands(L_NDVI).addBands(L_NDBI).addBands(L_NDWI); // predictors (order matters)
+var Y = L_LST;                                         // dependent
+
+var reg = X.addBands(Y).reduceRegion({
+  reducer: ee.Reducer.linearRegression({numX: 4, numY: 1}),
+  geometry: khulna,
+  scale: 30,
+  maxPixels: 1e10,
+  bestEffort: true
+});
+print('Linear regression result dict:', reg);
+
+// Extract coefficients (order: [constant, NDVI, NDBI, NDWI])
+var coefArr = ee.Array(reg.get('coefficients'));  // 4x1 array
+var b0    = ee.Number(coefArr.get([0, 0]));
+var bNDVI = ee.Number(coefArr.get([1, 0]));
+var bNDBI = ee.Number(coefArr.get([2, 0]));
+var bNDWI = ee.Number(coefArr.get([3, 0]));
+print('Equation: LST =', b0, '+', bNDVI, '*NDVI +', bNDBI, '*NDBI +', bNDWI, '*NDWI');
+
+// Landsat-scale model & residuals
+var L_model = L_NDVI.multiply(bNDVI)
+  .add(L_NDBI.multiply(bNDBI))
+  .add(L_NDWI.multiply(bNDWI))
+  .add(b0)                               // adding a number to an image is fine
+  .rename('L_model');
+var residuals = L_LST.subtract(L_model).rename('residuals');
+
+// -------------------- 6) PRE-DOWNSCALE DIAGNOSTICS (GLOBAL & CV) -------------------
+function regionStats(obs, pred, geom, scale) {
+  var diff = obs.subtract(pred).rename('diff');
+
+  var meanDiff = diff.reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: geom, scale: scale, maxPixels: 1e10, bestEffort: true
+  }).get('diff');
+
+  var mse = diff.pow(2).reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: geom, scale: scale, maxPixels: 1e10, bestEffort: true
+  }).get('diff');
+  var rmse = ee.Number(mse).sqrt();
+
+  var obsMean = obs.reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: geom, scale: scale, maxPixels: 1e10, bestEffort: true
+  }).get(obs.bandNames().get(0));
+  var sse = diff.pow(2).reduceRegion({
+    reducer: ee.Reducer.sum(), geometry: geom, scale: scale, maxPixels: 1e10, bestEffort: true
+  }).get('diff');
+  var sst = obs.subtract(ee.Number(obsMean)).pow(2).reduceRegion({
+    reducer: ee.Reducer.sum(), geometry: geom, scale: scale, maxPixels: 1e10, bestEffort: true
+  }).get(obs.bandNames().get(0));
+  var r2 = ee.Number(1).subtract(ee.Number(sse).divide(ee.Number(sst)));
+
+  return ee.Dictionary({mean_bias: meanDiff, RMSE: rmse, R2: r2});
+}
+print('Pre-downscale metrics (30 m):', regionStats(L_LST, L_model, khulna, 30));
+
+// Residual histogram (GEE)
+var hist = ui.Chart.image.histogram({image: residuals, region: khulna, scale: 30, maxPixels: 1e7})
+  .setOptions({title: 'Residuals Histogram (pre-downscale, 30 m)',
+               hAxis: {title: 'Residual (°C)'}, vAxis: {title: 'Count'}});
+print(hist);
+
+// Cross-validation (random 70/30) using global coefficients for prediction
+var trainingImg = L_LST.addBands([L_NDVI, L_NDBI, L_NDWI]).rename(['LST','NDVI','NDBI','NDWI']);
+var samples = trainingImg.sample({region: khulna, scale: 30, numPixels: 5000, seed: 42, geometries: false})
+  .randomColumn('rand', 42);
+var train = samples.filter(ee.Filter.lt('rand', 0.7));
+var test  = samples.filter(ee.Filter.gte('rand', 0.7));
+
+var testPred = test.map(function(ft){
+  var yhat = b0
+    .add(bNDVI.multiply(ee.Number(ft.get('NDVI'))))
+    .add(bNDBI.multiply(ee.Number(ft.get('NDBI'))))
+    .add(bNDWI.multiply(ee.Number(ft.get('NDWI'))));
+  return ft.set('pred', yhat);
+});
+
+var testDiff = testPred.map(function(ft){
+  var d = ee.Number(ft.get('LST')).subtract(ee.Number(ft.get('pred')));
+  return ft.set('diff', d).set('diff2', d.multiply(d));
+});
+
+var testBias = ee.Number(testDiff.reduceColumns(ee.Reducer.mean(), ['diff']).get('mean'));
+var testMSE  = ee.Number(testDiff.reduceColumns(ee.Reducer.mean(), ['diff2']).get('mean'));
+var testRMSE = testMSE.sqrt();
+print('Cross-validation (70/30) — RMSE, Bias (°C):', testRMSE, testBias);
+
+// -------------------- 7) GAUSSIAN SMOOTHING OF RESIDUALS ---------------------------
+var gauss = ee.Kernel.gaussian({radius: 1.5, units: 'pixels'});
+var residSmooth = residuals.resample('bicubic').convolve(gauss).rename('residSmooth');
+
+// Grab the Sentinel-2 10 m projection (CRS + scale)
+var tenProj  = S2_NDVI.projection();
+var tenCrs   = tenProj.crs();
+var tenScale = tenProj.nominalScale();
+
+// Put the smoothed residuals exactly on the S2 10 m grid
+var residSmooth10 = residSmooth.reproject({crs: tenCrs, scale: tenScale});
+
+// -------------------- 8) DOWNSCALE TO 10 m -----------------------------------------
+// IMPORTANT: start from an image band so the expression inherits the 10 m projection
+var S2_pred10 = S2_NDVI.multiply(bNDVI)
+  .add(S2_NDBI.multiply(bNDBI))
+  .add(S2_NDWI.multiply(bNDWI))
+  .add(b0)
+  .rename('S2_pred10')
+  // give it an explicit default projection so downstream reducers are happy
+  .setDefaultProjection(tenCrs, null, tenScale);
+
+var LST10_noRes = S2_pred10
+  .rename('LST10_noRes')
+  .setDefaultProjection(tenCrs, null, tenScale);
+
+var LST10_withRes = S2_pred10.add(residSmooth10)
+  .rename('LST10_withRes')
+  .setDefaultProjection(tenCrs, null, tenScale);
+
+// -------------------- 9) POST-DOWNSCALE: ENERGY CONSISTENCY (AGG 10→30 m) ----------
+function agg10to30(img10, template30) {
+  // aggregate 10 m to the Landsat 30 m grid by mean
+  var proj30      = template30.projection();
+  var proj30Crs   = proj30.crs();
+  var proj30Scale = proj30.nominalScale();
+
+  // reduceResolution requires a valid default projection on img10 (set above)
+  return img10
+    .reduceResolution({reducer: ee.Reducer.mean(), maxPixels: 2048})
+    .reproject({crs: proj30Crs, scale: proj30Scale});
+}
+
+var LST10_withRes_30 = agg10to30(LST10_withRes, L_LST);
+var LST10_noRes_30   = agg10to30(LST10_noRes,   L_LST);
+
+// Metrics vs Landsat LST
+print('Post-downscale metrics (with residuals, 10→30 m):', regionStats(L_LST, LST10_withRes_30, khulna, 30));
+print('Post-downscale metrics (no residuals, 10→30 m):',   regionStats(L_LST, LST10_noRes_30,   khulna, 30));
+
+// Residual maps @30 m
+var postRes_with = L_LST.subtract(LST10_withRes_30).rename('postRes_with');
+var postRes_no   = L_LST.subtract(LST10_noRes_30).rename('postRes_no');
+
+// Residual histogram (post)
+var histPost = ui.Chart.image.histogram({image: postRes_with, region: khulna, scale: 30, maxPixels: 1e7})
+  .setOptions({title: 'Residuals Histogram (post-downscale, with residual add-back, 30 m)',
+               hAxis: {title: 'Residual (°C)'}, vAxis: {title: 'Count'}});
+print(histPost);
+
+// -------------------- 10) EXPORTS FOR Q–Q & MORAN’S I (external analysis) ----------
+var residSamplesPre = residuals.sample({region: khulna, scale: 30, numPixels: 10000, geometries: false, seed: 13});
+Export.table.toDrive({
+  collection: residSamplesPre,
+  description: 'LST_PreDownscale_Residuals_Samples_Khulna',
+  fileFormat: 'CSV'
+});
+
+var residSamplesPost = postRes_with.sample({region: khulna, scale: 30, numPixels: 10000, geometries: false, seed: 14});
+Export.table.toDrive({
+  collection: residSamplesPost,
+  description: 'LST_PostDownscale_Residuals_Samples_Khulna',
+  fileFormat: 'CSV'
+});
+
+// -------------------- 11) OPTIONAL: EXPORT RASTERS ---------------------------------
+Export.image.toDrive({
+  image: LST10_withRes,
+  description: 'Khulna_LST10m_withResiduals_2024',
+  region: khulna,
+  scale: 10,
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+
+Export.image.toDrive({
+  image: L_LST,
+  description: 'Khulna_Landsat_LST30m_2024_ref',
+  region: khulna,
+  scale: 30,
+  maxPixels: 1e13,
+  fileFormat: 'GeoTIFF'
+});
+
+// -------------------- 12) QUICK MAP LAYERS (optional for visual QA) ----------------
+Map.addLayer(L_LST,         {min: 20, max: 45, palette: ['blue','cyan','yellow','orange','red']}, 'Landsat LST (30 m)', false);
+Map.addLayer(L_model,       {min: 20, max: 45, palette: ['blue','cyan','yellow','orange','red']}, 'LST Model (30 m)', false);
+Map.addLayer(residuals,     {min: -5, max: 5, palette: ['#2166ac','#f7f7f7','#b2182b']},          'Residuals (30 m)', false);
+Map.addLayer(LST10_noRes,   {min: 20, max: 45, palette: ['blue','cyan','yellow','orange','red']}, 'LST 10 m (no residuals)', false);
+Map.addLayer(LST10_withRes, {min: 20, max: 45, palette: ['blue','cyan','yellow','orange','red']}, 'LST 10 m (with residuals)', true);
+Map.addLayer(postRes_with,  {min: -5, max: 5, palette: ['#2166ac','#f7f7f7','#b2182b']},          'Post residuals (with add-back, 30 m)', false);
