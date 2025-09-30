@@ -1,0 +1,387 @@
+//  Define a point in Pabna
+var pabna = ee.Geometry.Point(89.232, 24.006);  // lon, lat
+Map.centerObject(pabna, 11);
+Map.addLayer(pabna, {color: 'red'}, 'Pabna point');
+
+//  Extract the basin that contains the point (HydroBASINS, level 7)
+var basins = ee.FeatureCollection('WWF/HydroSHEDS/v1/Basins/hybas_7');
+var basin = basins.filterBounds(pabna).first();               
+var basinGeom = ee.Feature(basin).geometry();
+Map.addLayer(basinGeom, {color: '0000FF', strokeWidth: 2}, 'Containing basin');
+
+//  Print details of the basin
+print('Basin feature:', basin);
+print('HYBAS_ID:', basin.get('HYBAS_ID'));
+print('SUB_AREA (km²):', basin.get('SUB_AREA'));   
+print('UP_AREA (km²):', basin.get('UP_AREA'));     
+
+// =============== USER INPUTS ==========================
+var START_YEAR = 1981;
+var END_YEAR   = 2024;              // inclusive
+
+// Return periods of interest (in YEARS)
+var T_YEARS_LIST = [2, 5, 10, 25, 50, 100];
+
+// Convert to appropriate temporal units
+var T_ANNUAL = T_YEARS_LIST;                                    // years
+var T_MONTHLY = T_YEARS_LIST.map(function(t) { return t * 12; }); // months
+var T_WEEKLY = T_YEARS_LIST.map(function(t) { return t * 52; });  // weeks
+
+print('Annual return periods (years):', T_ANNUAL);
+print('Monthly return periods (months):', T_MONTHLY);
+print('Weekly return periods (weeks):', T_WEEKLY);
+
+// =============== LOAD MERIT DEM =======================
+var merit = ee.Image('MERIT/DEM/v1_0_3').select('dem').clip(basinGeom);
+var meritProjection = merit.projection();
+var meritScale = meritProjection.nominalScale();
+
+print('MERIT DEM projection:', meritProjection);
+print('MERIT DEM scale (meters):', meritScale);
+print('MERIT DEM bounds:', merit.geometry().bounds());
+
+// Visualize DEM
+var demVis = {
+  min: 0,
+  max: 100,
+  palette: ['#004D00', '#008000', '#FFFF00', '#FF8000', '#FF0000', '#FFFFFF']
+};
+Map.addLayer(merit, demVis, 'MERIT DEM', false);
+
+// =============== LOAD AND RESAMPLE CHIRPS =============
+var chirpsRaw = ee.ImageCollection('UCSB-CHG/CHIRPS/DAILY')
+  .filterDate(ee.Date.fromYMD(START_YEAR,1,1), ee.Date.fromYMD(END_YEAR+1,1,1))
+  .filterBounds(basinGeom)
+  .select('precipitation');
+
+print('CHIRPS original count:', chirpsRaw.size());
+print('CHIRPS original projection:', chirpsRaw.first().projection());
+print('CHIRPS original scale:', chirpsRaw.first().projection().nominalScale());
+
+// Resample CHIRPS to exactly match MERIT DEM grid
+var chirps = chirpsRaw.map(function(img) {
+  return img
+    .resample('bilinear')
+    .reproject({
+      crs: meritProjection,
+      scale: meritScale
+    })
+    .clip(basinGeom);
+});
+
+print('CHIRPS resampled count:', chirps.size());
+print('CHIRPS resampled projection:', chirps.first().projection());
+print('CHIRPS resampled scale:', chirps.first().projection().nominalScale());
+
+// Verify pixel alignment
+var sampleChirps = chirps.first();
+var meritPixelCount = merit.reduceRegion({
+  reducer: ee.Reducer.count(),
+  geometry: basinGeom,
+  scale: meritScale,
+  maxPixels: 1e13,
+  crs: meritProjection
+}).get('dem');
+
+var chirpsPixelCount = sampleChirps.reduceRegion({
+  reducer: ee.Reducer.count(),
+  geometry: basinGeom,
+  scale: meritScale,
+  maxPixels: 1e13,
+  crs: meritProjection
+}).get('precipitation');
+
+print('MERIT pixel count in basin:', meritPixelCount);
+print('CHIRPS pixel count in basin:', chirpsPixelCount);
+print('Pixel counts match:', ee.Number(meritPixelCount).eq(chirpsPixelCount));
+
+var years = ee.List.sequence(START_YEAR, END_YEAR);
+var months = ee.List.sequence(1, 12);
+
+// =============== ANNUAL MAXIMA SERIES =================
+var annualMaxImages = years.map(function(year) {
+  var start = ee.Date.fromYMD(ee.Number(year), 1, 1);
+  var end = start.advance(1, 'year');
+  var yearlyMax = chirps.filterDate(start, end).max().clip(basinGeom).set('year', year);
+  return yearlyMax;
+});
+var annualMaxCollection = ee.ImageCollection.fromImages(annualMaxImages);
+
+// =============== MONTHLY MAXIMA SERIES =================
+var monthlyMaxImages = years.map(function(year) {
+  return months.map(function(month) {
+    var start = ee.Date.fromYMD(ee.Number(year), ee.Number(month), 1);
+    var end = start.advance(1, 'month');
+    var monthlyMax = chirps.filterDate(start, end).max().clip(basinGeom)
+      .set('year', year).set('month', month);
+    return monthlyMax;
+  });
+}).flatten();
+var monthlyMaxCollection = ee.ImageCollection.fromImages(monthlyMaxImages);
+
+// =============== WEEKLY MAXIMA SERIES =================
+var weeklyMaxImages = years.map(function(year) {
+  var start = ee.Date.fromYMD(ee.Number(year), 1, 1);
+  var end = start.advance(1, 'year');
+  var weeks = ee.List.sequence(0, end.difference(start, 'week').subtract(1))
+    .map(function(w) { return start.advance(w, 'week'); });
+  
+  return weeks.map(function(weekStart) {
+    weekStart = ee.Date(weekStart);
+    var weekEnd = weekStart.advance(1, 'week');
+    var weeklyMax = chirps.filterDate(weekStart, weekEnd).max().clip(basinGeom)
+      .set('year', year).set('week', weekStart.getRelative('week', 'year'));
+    return weeklyMax;
+  });
+}).flatten();
+var weeklyMaxCollection = ee.ImageCollection.fromImages(weeklyMaxImages);
+
+print('Annual max images:', annualMaxCollection.size());
+print('Monthly max images:', monthlyMaxCollection.size());
+print('Weekly max images:', weeklyMaxCollection.size());
+
+// =============== GUMBEL FUNCTION FOR RETURN PERIODS ===
+function calculateGumbelParams(collection) {
+  var meanImage = collection.mean();
+  var stdImage = collection.reduce(ee.Reducer.stdDev());
+  var countImage = collection.count();
+  
+  var euler = 0.5772156649015329;
+  var beta = stdImage.multiply(Math.sqrt(6)).divide(Math.PI);
+  var mu = meanImage.subtract(beta.multiply(euler));
+  
+  return ee.Image.cat([mu, beta, meanImage, stdImage, countImage])
+    .rename(['mu', 'beta', 'mean', 'stdDev', 'count']);
+}
+
+function calculateReturnLevel(T, params) {
+  var mu = params.select('mu');
+  var beta = params.select('beta');
+  var prob = ee.Image(1).subtract(ee.Image(1).divide(T));
+  var term = prob.log().multiply(-1).log();
+  return mu.subtract(beta.multiply(term)).rename('T' + T + '_year');
+}
+
+// =============== ANNUAL GUMBEL PARAMETERS =============
+var annualParams = calculateGumbelParams(annualMaxCollection);
+var annualReturnPeriods = T_ANNUAL.map(function(T) {
+  return calculateReturnLevel(T, annualParams);
+});
+var annualReturnStack = ee.Image.cat(annualReturnPeriods);
+
+// =============== MONTHLY GUMBEL PARAMETERS ============
+var monthlyParams = calculateGumbelParams(monthlyMaxCollection);
+var monthlyReturnPeriods = T_MONTHLY.map(function(T) {
+  return calculateReturnLevel(T, monthlyParams);
+});
+var monthlyReturnStack = ee.Image.cat(monthlyReturnPeriods);
+
+// =============== WEEKLY GUMBEL PARAMETERS =============
+var weeklyParams = calculateGumbelParams(weeklyMaxCollection);
+var weeklyReturnPeriods = T_WEEKLY.map(function(T) {
+  return calculateReturnLevel(T, weeklyParams);
+});
+var weeklyReturnStack = ee.Image.cat(weeklyReturnPeriods);
+
+// =============== VISUALIZATION ========================
+var precipPalette = ['#000080', '#0000FF', '#00FFFF', '#00FF00', '#FFFF00', '#FF8000', '#FF0000', '#800000'];
+
+// Annual visualization
+var visAnnual = {min: 50, max: 200, palette: precipPalette};
+Map.addLayer(annualReturnStack.select('T2_year'), visAnnual, 'Annual T=2yr', false);
+Map.addLayer(annualReturnStack.select('T10_year'), visAnnual, 'Annual T=10yr', false);
+Map.addLayer(annualReturnStack.select('T100_year'), visAnnual, 'Annual T=100yr');
+
+// Monthly visualization
+var visMonthly = {min: 40, max: 180, palette: precipPalette};
+Map.addLayer(monthlyReturnStack.select('T24_year'), visMonthly, 'Monthly T=2yr', false);
+Map.addLayer(monthlyReturnStack.select('T120_year'), visMonthly, 'Monthly T=10yr', false);
+Map.addLayer(monthlyReturnStack.select('T1200_year'), visMonthly, 'Monthly T=100yr', false);
+
+// Weekly visualization
+var visWeekly = {min: 30, max: 150, palette: precipPalette};
+Map.addLayer(weeklyReturnStack.select('T104_year'), visWeekly, 'Weekly T=2yr', false);
+Map.addLayer(weeklyReturnStack.select('T520_year'), visWeekly, 'Weekly T=10yr', false);
+Map.addLayer(weeklyReturnStack.select('T5200_year'), visWeekly, 'Weekly T=100yr', false);
+
+// =============== GUMBEL FITTING FUNCTION ==============
+function fitGumbelAndChart(collection, valueProperty, title, exportPrefix, T_list, timeUnit) {
+  var reducer = ee.Reducer.mean()
+    .combine({reducer2: ee.Reducer.stdDev(), sharedInputs: true})
+    .combine({reducer2: ee.Reducer.count(), sharedInputs: true});
+  
+  var stats = collection.reduceColumns(reducer, [valueProperty]);
+  var xbar = ee.Number(stats.get('mean'));
+  var s = ee.Number(stats.get('stdDev'));
+  var n = ee.Number(stats.get('count'));
+  
+  var euler = ee.Number(0.5772156649015329);
+  var beta = s.multiply(Math.sqrt(6)).divide(Math.PI);
+  var mu = xbar.subtract(euler.multiply(beta));
+  
+  // Calculate return levels with T in appropriate units
+  var rpList = ee.List(T_list).map(function(T) {
+    T = ee.Number(T);
+    var pNonExc = ee.Number(1).subtract(ee.Number(1).divide(T));
+    var term = pNonExc.log().multiply(-1).log();
+    var xT = mu.subtract(beta.multiply(term));
+    
+    // Convert T back to years for display
+    var T_years = timeUnit === 'months' ? T.divide(12) : 
+                  timeUnit === 'weeks' ? T.divide(52) : T;
+    
+    return ee.Feature(null, {
+      'T_years': T_years, 
+      'T_units': T,
+      'xT_mm': xT, 
+      'source': 'Gumbel'
+    });
+  });
+  var rpFC = ee.FeatureCollection(rpList);
+  
+  // Empirical Weibull
+  var sortedList = collection.sort(valueProperty, false).toList(collection.size());
+  var empList = ee.List.sequence(1, n).map(function(rank) {
+    rank = ee.Number(rank);
+    var f = ee.Feature(sortedList.get(rank.subtract(1)));
+    var value = ee.Number(f.get(valueProperty));
+    var prob = rank.divide(n.add(1));
+    var T = ee.Number(1).divide(ee.Number(1).subtract(prob));
+    
+    // Convert empirical T to years for display
+    var T_years = timeUnit === 'months' ? T.divide(12) : 
+                  timeUnit === 'weeks' ? T.divide(52) : T;
+    
+    return ee.Feature(null, {
+      'T_years': T_years,
+      'T_units': T,
+      'xT_mm': value, 
+      'source': 'Empirical'
+    });
+  });
+  var empFC = ee.FeatureCollection(empList);
+  
+  // Create frequency curve
+  var freqChart = ui.Chart.feature.groups({
+    features: rpFC.merge(empFC),
+    xProperty: 'T_years',
+    yProperty: 'xT_mm',
+    seriesProperty: 'source'
+  })
+  .setChartType('ScatterChart')
+  .setOptions({
+    title: title + ' - Rainfall Frequency Curve (Return Period in YEARS)',
+    hAxis: {title: 'Return Period (years)', logScale: true},
+    vAxis: {title: 'Rainfall (mm)'},
+    pointSize: 6,
+    lineWidth: 2,
+    series: {
+      0: {color: 'blue', lineWidth: 2, pointSize: 6, pointShape: 'circle'},
+      1: {color: 'red', lineWidth: 0, pointSize: 8, pointShape: 'diamond'}
+    }
+  });
+  
+  print(title + ' - Gumbel Parameters:', {mu: mu, beta: beta, n: n});
+  print(title + ' - Time units used:', timeUnit);
+  print(freqChart);
+  
+  // Export tables
+  Export.table.toDrive({
+    collection: collection,
+    description: exportPrefix + '_Data_' + START_YEAR + '_' + END_YEAR,
+    fileFormat: 'CSV'
+  });
+  
+  Export.table.toDrive({
+    collection: rpFC,
+    description: exportPrefix + '_Gumbel_RP_' + START_YEAR + '_' + END_YEAR,
+    fileFormat: 'CSV'
+  });
+}
+
+// =============== BASIN-AVERAGE TIME SERIES ============
+var annualAMS = ee.FeatureCollection(years.map(function(y) {
+  y = ee.Number(y);
+  var start = ee.Date.fromYMD(y, 1, 1);
+  var end = start.advance(1, 'year');
+  var yearlyMax = chirps.filterDate(start, end).max();
+  var value = yearlyMax.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: basinGeom,
+    scale: 5000,
+    maxPixels: 1e13
+  }).get('precipitation');
+  return ee.Feature(null, {'year': y, 'annual_max_mm': value});
+})).filter(ee.Filter.notNull(['annual_max_mm']));
+
+var monthlyAMS = ee.FeatureCollection(years.map(function(year) {
+  return months.map(function(month) {
+    var start = ee.Date.fromYMD(ee.Number(year), ee.Number(month), 1);
+    var end = start.advance(1, 'month');
+    var monthlyMax = chirps.filterDate(start, end).max();
+    var value = monthlyMax.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: basinGeom,
+      scale: 5000,
+      maxPixels: 1e13
+    }).get('precipitation');
+    return ee.Feature(null, {
+      'year': year, 'month': month, 'monthly_max_mm': value
+    });
+  });
+}).flatten()).filter(ee.Filter.notNull(['monthly_max_mm']));
+
+var weeklyAMS = ee.FeatureCollection(years.map(function(year) {
+  var start = ee.Date.fromYMD(ee.Number(year), 1, 1);
+  var end = start.advance(1, 'year');
+  var weeks = ee.List.sequence(0, end.difference(start, 'week').subtract(1))
+    .map(function(w) { return start.advance(w, 'week'); });
+  
+  return weeks.map(function(weekStart) {
+    weekStart = ee.Date(weekStart);
+    var weekEnd = weekStart.advance(1, 'week');
+    var weeklyMax = chirps.filterDate(weekStart, weekEnd).max();
+    var value = weeklyMax.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: basinGeom,
+      scale: 5000,
+      maxPixels: 1e13
+    }).get('precipitation');
+    return ee.Feature(null, {
+      'year': year, 'week': weekStart.getRelative('week', 'year'), 'weekly_max_mm': value
+    });
+  });
+}).flatten()).filter(ee.Filter.notNull(['weekly_max_mm']));
+
+// =============== GENERATE CHARTS ======================
+fitGumbelAndChart(annualAMS, 'annual_max_mm', 'ANNUAL', 'Annual', T_ANNUAL, 'years');
+fitGumbelAndChart(monthlyAMS, 'monthly_max_mm', 'MONTHLY', 'Monthly', T_MONTHLY, 'months');
+fitGumbelAndChart(weeklyAMS, 'weekly_max_mm', 'WEEKLY', 'Weekly', T_WEEKLY, 'weeks');
+
+// =============== EXPORT RETURN PERIOD MAPS ============
+Export.image.toDrive({
+  image: annualReturnStack,
+  description: 'Annual_Return_Period_Maps',
+  region: basinGeom,
+  scale: 5000,
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: monthlyReturnStack,
+  description: 'Monthly_Return_Period_Maps',
+  region: basinGeom,
+  scale: 5000,
+  maxPixels: 1e13
+});
+
+Export.image.toDrive({
+  image: weeklyReturnStack,
+  description: 'Weekly_Return_Period_Maps',
+  region: basinGeom,
+  scale: 5000,
+  maxPixels: 1e13
+});
+
+print('=== ANALYSIS COMPLETE ===');
+print('Check the Console for charts and Tasks tab for exports');
